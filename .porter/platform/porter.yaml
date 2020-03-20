@@ -1,0 +1,214 @@
+# This is the configuration for Porter
+# You must define steps for each action, but the rest is optional
+# See https://porter.sh/author-bundles for documentation on how to configure your bundle
+# Uncomment out the sections below to take full advantage of what Porter can do!
+
+name: azure-function-platform-kubernetes
+version: 0.1.0
+dockerfile: Dockerfile.tmpl
+description: "A dev bundle that installs and uninstalls the Azure functions environment on a Kubernetes cluster. This bundle removes the entire environment on uninstall, and so is intended only for developer-controlled clusters."
+invocationImage: jeffhollan/azure-functions-platform:v0.1.0-kubernetes
+tag: jeffhollan/azure-functions-platform-bundle:v0.1.0-kubernetes
+
+# Uncomment out the line below to use a template Dockerfile for your invocation image
+#dockerfile: Dockerfile.tmpl
+
+mixins:
+  - exec
+  - kubernetes
+  - helm3
+  - az
+
+parameters:
+  - name: dns_name
+    type: string
+    default: functions
+    description: The DNS name to to associate with public IP address for the FQDN
+  - name: letsencrypt_email
+    type: string
+    description: Valid email address to use for Let's Encrypt certificate
+    destination:
+      env: LETSENCRYPT_EMAIL
+
+install:
+  - kubernetes:
+      description: "Create namespaces..."
+      manifests:
+        - namespace.yaml
+      wait: true
+  - helm3:
+      description: "Add stable repo..."
+      arguments:
+        - repo
+        - add
+        - stable
+        - https://kubernetes-charts.storage.googleapis.com
+  - helm3:
+      description: "Installing nginx..."
+      arguments:
+        - install
+        - nginx
+        - stable/nginx-ingress
+        - -n
+        - ingress-nginx
+        - -f
+        - nginx-ingress-values.yaml
+        - --version
+        - '1.26.2'
+  - az: 
+      description: "Azure CLI login"
+      arguments: 
+        - "login" 
+      flags:
+        service-principal: 
+        username: "{{ bundle.credentials.azure_client_id}}"
+        password: "{{ bundle.credentials.azure_client_secret}}"
+        tenant: "{{ bundle.credentials.azure_tenant_id}}"
+  - az: 
+      description: "Azure CLI set subscription"
+      arguments: 
+        - "account" 
+        - "set" 
+      flags:
+        subscription: "{{ bundle.credentials.azure_subscription_id}}"
+  - exec:
+      description: "Configure DNS name"
+      command: "bash"
+      arguments:
+        - "configure-dns-name.sh"
+        - ingress-nginx
+        - nginx
+        - "{{ bundle.parameters.dns_name }}"
+      outputs:
+        - name: fqdn
+          path: FQDN
+  - exec:
+      description: "Install cert-manager"
+      command: "bash"
+      arguments:
+        - "-c"
+        - |
+          kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.12.0/cert-manager.yaml
+          echo "Waiting for cert-manager to start running....."
+          kubectl wait pod --for=condition=Ready -l app=webhook -n cert-manager --timeout 300s
+  - kubernetes:
+      description: "Create a CA cluster issuer"
+      manifests:
+        - cluster-issuer.yaml
+      wait: true
+  
+  - exec:
+      description: "Deploy Prometheus"
+      command: "bash"
+      arguments:
+        - "-c"
+        - |
+          kubectl apply --kustomize ./prometheus/
+  - helm3:
+      description: "Add kedacore repo..."
+      arguments:
+        - repo
+        - add
+        - kedacore
+        - https://kedacore.github.io/charts
+  - helm3:
+      description: "Deploy KEDA"
+      arguments:
+        - install
+        - keda
+        - kedacore/keda
+        - --namespace
+        - keda
+
+  - kubernetes:
+      description: "Create cert-manager config"
+      manifests:
+        - prod-cert-manager.yaml
+      wait: true
+
+        
+
+outputs:
+  - name: fqdn
+    type: string
+    applyTo:
+      - install
+    description: "Fully qualified domain name for the ingress controller" 
+
+uninstall:
+  - helm3:
+      description: "Delete KEDA"
+      arguments:
+        - delete
+        - keda
+        - --namespace
+        - keda
+  - exec:
+      command: kubectl
+      description: "Deleting Keda namespace..."
+      arguments:
+        - delete
+        - ns
+        - keda
+  - exec:
+      command: kubectl
+      description: "Removing KEDA CRDs...."
+      arguments:
+        - delete
+        - crds
+        - scaledobjects.keda.k8s.io
+        - triggerauthentications.keda.k8s.io
+  - exec:
+      description: "Deleting Prometheus..."
+      command: "kubectl"
+      arguments:
+        - delete
+        - --kustomize
+        - ./prometheus/
+  - kubernetes:
+      description: "Deleting the CA cluster issuer..."
+      manifests:
+        - cluster-issuer.yaml
+      wait: true
+  - exec:
+      description: "Deleting cert-manager..."
+      command: "bash"
+      arguments:
+        - "-c"
+        - kubectl delete -f https://github.com/jetstack/cert-manager/releases/download/v0.12.0/cert-manager.yaml || true
+# needed at end         kubectl delete namespace cert-manager
+#          echo "Waiting for cert-manager to start running....."
+#        - kubectl wait pod --for=delete -l app=webhook -n cert-manager --timeout 300s
+  - helm3:
+      description: "Deleting nginx release..."
+      arguments:
+        - delete
+        - nginx
+        - --namespace
+        - ingress-nginx
+  - exec:
+      command: kubectl
+      description: "Deleting ingress-nginx namespace...."
+      arguments:
+        - delete
+        - ns
+        - ingress-nginx
+
+
+# See https://porter.sh/wiring/#credentials
+credentials:
+  - name: kubeconfig
+    path: /root/.kube/config
+    default: ~/.kube/config
+  - name: azure_client_id
+    env: AZURE_CLIENT_ID
+    description: AAD Client ID for Azure account authentication - used for Az CLI
+  - name: azure_tenant_id
+    env: AZURE_TENANT_ID
+    description: Azure AAD Tenant Id for Azure account authentication  - used for Az CLI
+  - name: azure_client_secret
+    env: AZURE_CLIENT_SECRET
+    description: AAD Client Secret for Azure account authentication - used for Az CLI
+  - name: azure_subscription_id
+    env: AZURE_SUBSCRIPTION_ID
+    description: Azure Subscription Id used to set the subscription where the account has access to multiple subscriptions

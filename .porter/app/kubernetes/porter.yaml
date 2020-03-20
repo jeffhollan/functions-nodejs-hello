@@ -1,0 +1,63 @@
+# This is the configuration for Porter
+# You must define steps for each action, but the rest is optional
+# See https://porter.sh/author-bundles for documentation on how to configure your bundle
+# Uncomment out the sections below to take full advantage of what Porter can do!
+
+name: azure-function-app-kubernetes
+version: 0.1.0
+dockerfile: Dockerfile.tmpl
+description: "A dev bundle that installs and uninstalls the Azure functions environment on a Kubernetes cluster. This bundle removes the entire environment on uninstall, and so is intended only for developer-controlled clusters."
+invocationImage: jeffhollan/azure-functions-app:v0.1.0-kubernetes
+tag: jeffhollan/azure-functions-app-bundle:v0.1.0-kubernetes
+
+# Uncomment the line below to use a template Dockerfile for your invocation image
+#dockerfile: Dockerfile.tmpl
+
+mixins:
+  - exec
+  - kubernetes
+
+parameters:
+  - name: host
+    default: functions.westus2.cloudapp.azure.com
+    type: string
+    description: The full hostname for the site (likely the outputs of the platform install)
+  - name: image_name
+    default: jeffhollan/java-azure-functions:v0.1
+    type: string
+    description: The docker image for the Azure Function container
+
+install:
+  - exec:
+      description: "Generate deployment...."
+      command: "bash"
+      arguments: 
+        - ./generate-deploy.sh
+        - "{{ bundle.parameters.host }}"
+        - "{{ bundle.parameters.image_name }}"
+  - kubernetes:
+      description: "Deploy function app..."
+      manifests:
+        - generated-deploy.yaml
+      wait: true
+
+uninstall:
+  - kubernetes:
+      description: "Remove function app"
+      manifests:
+        - deploy.yaml
+      wait: true
+
+# See https://porter.sh/author-bundles/#dependencies
+dependencies:
+  azure-functions-platform-kubernetes:
+    tag: jeffhollan/azure-functions-platform-bundle:v0.1.0-kubernetes
+    parameters:
+      letsencrypt_email: "{{ bundle.parameters.letsencrypt_email }}"
+      dns_name: "{{ bundle.parameters.dns_name }}"
+
+# See https://porter.sh/wiring/#credentials
+credentials:
+  - name: kubeconfig
+    path: /root/.kube/config
+    default: ~/.kube/config
